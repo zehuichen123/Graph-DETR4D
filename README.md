@@ -6,8 +6,8 @@
 <a href="https://arxiv.org/abs/2204.11582">[ACM MM 2022 Paper]</a>
 <center>
 <img src='figs/framework.png'>
-
 </center>
+</div>
 
 ## Usage
 
