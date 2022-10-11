@@ -9,13 +9,19 @@
 
 ## Performance
 
+### Nuscenes Validation Set
+| Model | mAP | NDS |
+| -|-|-|
+| DETR3D | 33.6 |  41.4  |
+| Graph-DETR3D | 35.1 | 43.3 |
+
+
 ### Nuscenes Test Leaderboard
 | Model | mAP | NDS |
 | -|-|-|
 | DETR3D | 41.2 |  47.9  |
 | Graph-DETR3D | 42.5 | 49.5 |
 
-## Code Coming Soon ~
 
 ## Citation
 If you find our work useful for your research, please consider citing the paper
