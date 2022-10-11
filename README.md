@@ -1,4 +1,4 @@
-## Graph-DETR3D
+## Graph-DETR3D (ACM MM2022)
 
 > Graph-DETR3D: Rethinking Overlapping Regions for Multi-View 3D Object Detection
 <a href="https://arxiv.org/abs/2204.11582">Arxiv Link</a>
@@ -6,6 +6,21 @@
 <img src='figs/framework.png'>
 
 </center>
+
+## Usage
+
+### Train
+
+```
+./tools/dist_train.sh projects/graphdetr3d/xxx.py 8
+```
+
+### Infer
+
+```
+./tools/dist_test.sh projects/graphdetr3d/xxx.py work_dirs/xxx/epoch_12.pth 8 --eval bbox
+```
+
 
 ## Performance
 
