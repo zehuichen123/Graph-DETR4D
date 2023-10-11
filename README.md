@@ -4,7 +4,7 @@
 <br>Zehui Chen, Zheng Chen, Zhenyu Li, Shiquan Zhang, Liangji Fang, Qinhong Jiang, Feng Zhao. 
 <br>
 <center>
-<img src='figs/framework.png'>
+<img src='https://github.com/zehuichen123/Graph-DETR4D/assets/24351120/7c8ede6d-ad18-40c0-9ec9-898745e4b2e7'>
 </center>
 </div>
 
