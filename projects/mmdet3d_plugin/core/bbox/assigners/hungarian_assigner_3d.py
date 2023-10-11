@@ -1,3 +1,12 @@
+# ------------------------------------------------------------------------
+# Copyright (c) 2021 megvii-model. All Rights Reserved.
+# ------------------------------------------------------------------------
+# Modified from DETR3D (https://github.com/WangYueFt/detr3d)
+# Copyright (c) 2021 Wang, Yue
+# ------------------------------------------------------------------------
+# Modified from mmdetection (https://github.com/open-mmlab/mmdetection)
+# Copyright (c) OpenMMLab. All rights reserved.
+# ------------------------------------------------------------------------
 import torch
 
 from mmdet.core.bbox.builder import BBOX_ASSIGNERS
@@ -118,6 +127,7 @@ class HungarianAssigner3D(BaseAssigner):
         if linear_sum_assignment is None:
             raise ImportError('Please run "pip install scipy" '
                               'to install scipy first.')
+        cost = torch.nan_to_num(cost, nan=100.0, posinf=100.0, neginf=-100.0)
         matched_row_inds, matched_col_inds = linear_sum_assignment(cost)
         matched_row_inds = torch.from_numpy(matched_row_inds).to(
             bbox_pred.device)

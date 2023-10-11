@@ -8,21 +8,6 @@
 </center>
 </div>
 
-## Usage
-
-### Train
-
-```
-./tools/dist_train.sh projects/configs/graphdetr4d/graphdetr3d_res50_gridmask_cbgs_fullset_1x.py 8
-```
-
-### Infer
-
-```
-./tools/dist_test.sh projects/configs/graphdetr3d/graphdetr3d_res50_gridmask_cbgs_fullset_1x.py work_dirs/graphdetr3d_res50_gridmask_cbgs_fullset_1x/epoch_12.pth 8 --eval bbox
-```
-
-
 ## Performance
 
 ### Nuscenes Validation Set

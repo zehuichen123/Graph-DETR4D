@@ -22,7 +22,7 @@ def parse_args():
         description='MMDet test (and eval) a model')
     parser.add_argument('config', help='test config file path')
     parser.add_argument('checkpoint', help='checkpoint file')
-    parser.add_argument('--out', help='output result file in pickle format')
+    parser.add_argument('--out', default = 'result.pkl', help='output result file in pickle format')
     parser.add_argument(
         '--fuse-conv-bn',
         action='store_true',
@@ -37,6 +37,7 @@ def parse_args():
     parser.add_argument(
         '--eval',
         type=str,
+        default="bbox",
         nargs='+',
         help='evaluation metrics, which depends on the dataset, e.g., "bbox",'
         ' "segm", "proposal" for COCO, and "mAP", "recall" for PASCAL VOC')
@@ -101,6 +102,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+
     assert args.out or args.eval or args.format_only or args.show \
         or args.show_dir, \
         ('Please specify at least one operation (save/eval/format/show the '
@@ -191,7 +193,6 @@ def main():
     # build the model and load checkpoint
     cfg.model.train_cfg = None
     model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
-
     fp16_cfg = cfg.get('fp16', None)
     if fp16_cfg is not None:
         wrap_fp16_model(model)
@@ -227,7 +228,6 @@ def main():
         if args.out:
             print(f'\nwriting results to {args.out}')
             mmcv.dump(outputs, args.out)
-            # outputs = mmcv.load(args.out)
         kwargs = {} if args.eval_options is None else args.eval_options
         if args.format_only:
             dataset.format_results(outputs, **kwargs)

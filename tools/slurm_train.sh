@@ -1,6 +1,16 @@
-#!/usr/bin/env bash
+# #!/usr/bin/env bash
 
 set -x
+
+# PARTITION=${PARTITION:-AD-Share}
+# JOB_NAME=$1
+# CONFIG=$2
+# WORK_DIR=$3
+# GPUS=${GPUS:-16}
+# GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+# CPUS_PER_TASK=${CPUS_PER_TASK:-5}
+# SRUN_ARGS=${SRUN_ARGS:-""}
+# PY_ARGS=${@:4}
 
 PARTITION=$1
 JOB_NAME=$2

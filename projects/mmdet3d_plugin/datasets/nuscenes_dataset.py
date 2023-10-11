@@ -1,32 +1,26 @@
+# ------------------------------------------------------------------------
+# Copyright (c) 2022 megvii-model. All Rights Reserved.
+# ------------------------------------------------------------------------
+# Modified from DETR3D (https://github.com/WangYueFt/detr3d)
+# Copyright (c) 2021 Wang, Yue
+# ------------------------------------------------------------------------
+# Modified from mmdetection3d (https://github.com/open-mmlab/mmdetection3d)
+# Copyright (c) OpenMMLab. All rights reserved.
+# ------------------------------------------------------------------------
 import numpy as np
 from mmdet.datasets import DATASETS
 from mmdet3d.datasets import NuScenesDataset
-# from mmdet3d.core.bbox.box_np_ops import points_cam2img
-# from nuscenes.utils.geometry_utils import view_points
-# from pyquaternion import Quaternion
-import torch
-from mmdet3d.core import show_multi_modality_result
-from mmdet3d.core.visualizer.image_vis import (draw_camera_bbox3d_on_img, draw_depth_bbox3d_on_img,
-                        draw_lidar_bbox3d_on_img)
-import copy
-import mmcv
-import cv2
-import os.path as osp
-from tqdm import tqdm
+import os
 
 @DATASETS.register_module()
 class CustomNuScenesDataset(NuScenesDataset):
     r"""NuScenes Dataset.
-
     This datset only add camera intrinsics and extrinsics to the results.
     """
-
     def get_data_info(self, index):
         """Get data info according to the given index.
-
         Args:
             index (int): Index of the sample data to get.
-
         Returns:
             dict: Data information that will be passed to the data \
                 preprocessing pipelines. It includes the following keys:
@@ -52,9 +46,11 @@ class CustomNuScenesDataset(NuScenesDataset):
         if self.modality['use_camera']:
             image_paths = []
             lidar2img_rts = []
-            lidar2cam_rts = []
-            cam_intrinsics = []
+            intrinsics = []
+            extrinsics = []
+            img_timestamp = []
             for cam_type, cam_info in info['cams'].items():
+                img_timestamp.append(cam_info['timestamp'] / 1e6)
                 image_paths.append(cam_info['data_path'])
                 # obtain lidar to image transformation matrix
                 lidar2cam_r = np.linalg.inv(cam_info['sensor2lidar_rotation'])
@@ -67,21 +63,23 @@ class CustomNuScenesDataset(NuScenesDataset):
                 viewpad = np.eye(4)
                 viewpad[:intrinsic.shape[0], :intrinsic.shape[1]] = intrinsic
                 lidar2img_rt = (viewpad @ lidar2cam_rt.T)
+                intrinsics.append(viewpad)
+                extrinsics.append(lidar2cam_rt)  ###The extrinsics mean the tranformation from lidar to camera. If anyone want to use the extrinsics as sensor to lidar, please use np.linalg.inv(lidar2cam_rt.T) and modify the ResizeCropFlipImage and LoadMultiViewImageFromMultiSweepsFiles.
                 lidar2img_rts.append(lidar2img_rt)
-
-                cam_intrinsics.append(viewpad)
-                lidar2cam_rts.append(lidar2cam_rt.T)
 
             input_dict.update(
                 dict(
+                    img_timestamp=img_timestamp,
                     img_filename=image_paths,
                     lidar2img=lidar2img_rts,
-                    cam_intrinsic=cam_intrinsics,
-                    lidar2cam=lidar2cam_rts,
+                    intrinsics=intrinsics,
+                    extrinsics=extrinsics,
+                    cam_infos=info['cams'],  # NOTE: in order to compute for adjcent frames
+                    lidar2ego_rotation=info['lidar2ego_rotation'],
+                    lidar2ego_translation=info['lidar2ego_translation'],
                 ))
 
         if not self.test_mode:
             annos = self.get_ann_info(index)
             input_dict['ann_info'] = annos
-
         return input_dict

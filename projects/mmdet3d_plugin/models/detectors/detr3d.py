@@ -6,7 +6,6 @@ from mmdet3d.core import bbox3d2result
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
 from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
 
-import time
 
 @DETECTORS.register_module()
 class Detr3D(MVXTwoStageDetector):
@@ -27,8 +26,7 @@ class Detr3D(MVXTwoStageDetector):
                  img_rpn_head=None,
                  train_cfg=None,
                  test_cfg=None,
-                 pretrained=None,
-                 detach=False):
+                 pretrained=None):
         super(Detr3D,
               self).__init__(pts_voxel_layer, pts_voxel_encoder,
                              pts_middle_encoder, pts_fusion_layer,
@@ -37,7 +35,6 @@ class Detr3D(MVXTwoStageDetector):
                              train_cfg, test_cfg, pretrained)
         self.grid_mask = GridMask(True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7)
         self.use_grid_mask = use_grid_mask
-        self.detach = detach
 
     def extract_img_feat(self, img, img_metas):
         """Extract features of images."""
@@ -47,6 +44,7 @@ class Detr3D(MVXTwoStageDetector):
             # update real input shape of each single img
             for img_meta in img_metas:
                 img_meta.update(input_shape=input_shape)
+
             if img.dim() == 5 and img.size(0) == 1:
                 img.squeeze_()
             elif img.dim() == 5 and img.size(0) > 1:
@@ -149,20 +147,11 @@ class Detr3D(MVXTwoStageDetector):
             dict: Losses of different branches.
         """
         img_feats = self.extract_feat(img=img, img_metas=img_metas)
-        if self.detach:
-            img_feats = [img_feat.detach() for img_feat in img_feats]
         losses = dict()
         losses_pts = self.forward_pts_train(img_feats, gt_bboxes_3d,
                                             gt_labels_3d, img_metas,
                                             gt_bboxes_ignore)
         losses.update(losses_pts)
-        # losses_sum = 0.
-        # for loss in losses:
-        #     losses_sum += losses[loss]
-        # losses_sum.backward()
-        # for name, param in self.named_parameters():
-        #     if param.grad is None:
-        #         print(name)
         return losses
     
     def forward_test(self, img_metas, img=None, **kwargs):
@@ -191,26 +180,13 @@ class Detr3D(MVXTwoStageDetector):
     
     def simple_test(self, img_metas, img=None, rescale=False):
         """Test function without augmentaiton."""
-        # torch.cuda.synchronize()
-        # t0 = time.time()
-
         img_feats = self.extract_feat(img=img, img_metas=img_metas)
 
-        # torch.cuda.synchronize()
-        # t1 = time.time()
-        
         bbox_list = [dict() for i in range(len(img_metas))]
         bbox_pts = self.simple_test_pts(
             img_feats, img_metas, rescale=rescale)
-
-        # torch.cuda.synchronize()
-        # t2 = time.time()
-        
-        # print("Img Backbone: %g s, Detect Head: %g s, Total Time: %g s" % ((t1 - t0), (t2 - t1), (t2 - t0)))
-        
         for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
             result_dict['pts_bbox'] = pts_bbox
-        
         return bbox_list
 
     def aug_test_pts(self, feats, img_metas, rescale=False):

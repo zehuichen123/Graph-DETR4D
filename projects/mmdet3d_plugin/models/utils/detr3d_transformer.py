@@ -1,4 +1,12 @@
-
+# ------------------------------------------------------------------------
+# Copyright (c) 2022 megvii-model. All Rights Reserved.
+# ------------------------------------------------------------------------
+# Modified from DETR3D (https://github.com/WangYueFt/detr3d)
+# Copyright (c) 2021 Wang, Yue
+# ------------------------------------------------------------------------
+# Modified from mmdetection3d (https://github.com/open-mmlab/mmdetection3d)
+# Copyright (c) OpenMMLab. All rights reserved.
+# ------------------------------------------------------------------------
 import numpy as np
 import torch
 import torch.nn as nn
@@ -10,11 +18,11 @@ from mmcv.cnn.bricks.transformer import (MultiScaleDeformableAttention,
                                          TransformerLayerSequence,
                                          build_transformer_layer_sequence)
 from mmcv.runner.base_module import BaseModule
-
-from mmdet.models.utils.builder import TRANSFORMER
-from .deform_cross_attn import DeformCrossAttn
 from .deform3d_cross_attn import Deform3DCrossAttn
-from mmdet3d.core.bbox.structures.utils import limit_period, rotation_3d_in_axis
+from mmdet3d.core.bbox.structures.utils import rotation_3d_in_axis
+from mmdet.models.utils.builder import TRANSFORMER
+import math
+import warnings
 
 
 def inverse_sigmoid(x, eps=1e-5):
@@ -71,10 +79,7 @@ class Detr3DTransformer(BaseModule):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
         for m in self.modules():
-            if isinstance(m, MultiScaleDeformableAttention) \
-            or isinstance(m, Detr3DCrossAtten)\
-            or isinstance(m, DeformCrossAttn)\
-            or isinstance(m, Deform3DCrossAttn):
+            if isinstance(m, MultiScaleDeformableAttention) or isinstance(m, Detr3DCrossAtten) or isinstance(m, Deform3DCrossAttn):
                 m.init_weight()
         xavier_init(self.reference_points, distribution='uniform', bias=0.)
 
@@ -154,10 +159,9 @@ class Detr3DTransformerDecoder(TransformerLayerSequence):
             `LN`.
     """
 
-    def __init__(self, *args, return_intermediate=False, multi_points=False, **kwargs):
+    def __init__(self, *args, return_intermediate=False, **kwargs):
         super(Detr3DTransformerDecoder, self).__init__(*args, **kwargs)
         self.return_intermediate = return_intermediate
-        self.multi_points = multi_points
 
     def forward(self,
                 query,
@@ -185,16 +189,12 @@ class Detr3DTransformerDecoder(TransformerLayerSequence):
         output = query
         intermediate = []
         intermediate_reference_points = []
-        bs, num_query, _ = reference_points.shape
         for lid, layer in enumerate(self.layers):
-            if lid == 0 and self.multi_points:
-                padding_referent_points = reference_points.new_zeros((bs, num_query * 8, 3))
-                reference_points = torch.cat([reference_points, padding_referent_points], dim=1)
-            # experimentally add regression whl to the layer inputs
+            reference_points_input = reference_points
             output = layer(
                 output,
                 *args,
-                reference_points=reference_points,
+                reference_points=reference_points_input,
                 **kwargs)
             output = output.permute(1, 0, 2)
 
@@ -203,33 +203,12 @@ class Detr3DTransformerDecoder(TransformerLayerSequence):
                 
                 assert reference_points.shape[-1] == 3
 
-                reference_points = reference_points[:, :num_query, ...]
-
                 new_reference_points = torch.zeros_like(reference_points)
                 new_reference_points[..., :2] = tmp[
                     ..., :2] + inverse_sigmoid(reference_points[..., :2])
                 new_reference_points[..., 2:3] = tmp[
                     ..., 4:5] + inverse_sigmoid(reference_points[..., 2:3])
-                reference_points_3d = new_reference_points.clone().sigmoid()
-                # decode center into 8 anchors
-                if self.multi_points:
-                    tmp = tmp.view(bs * num_query, -1)
-                    dims = torch.cat([tmp[:, 2:4], tmp[:, 5:6]], dim=-1)
-                    corners_norm = torch.from_numpy(
-                        np.stack(np.unravel_index(np.arange(8), [2] * 3), axis=1)).to(
-                            device=dims.device, dtype=dims.dtype)
-                    corners_norm = corners_norm[[0, 1, 3, 2, 4, 5, 7, 6]]
-                    # use relative origin [0.5, 1, 0.5]
-                    corners_norm = corners_norm - dims.new_tensor([0.5, 1, 0.5])
-                    corners = dims.view([-1, 1, 3]) * corners_norm.reshape([1, 8, 3])
-
-                    # rotate around y axis
-                    corners = rotation_3d_in_axis(corners, tmp[:, 6], axis=1)
-                    corners += new_reference_points.view(-1, 1, 3)
-                    
-                    anchor_points = corners.view(bs, num_query * 8, 3)
-                    # (bs, num_query * 9, 3)
-                    new_reference_points = torch.cat([new_reference_points, anchor_points], dim=1)
+                
                 new_reference_points = new_reference_points.sigmoid()
 
                 reference_points = new_reference_points.detach()
@@ -237,13 +216,14 @@ class Detr3DTransformerDecoder(TransformerLayerSequence):
             output = output.permute(1, 0, 2)
             if self.return_intermediate:
                 intermediate.append(output)
-                intermediate_reference_points.append(reference_points_3d.detach())
+                intermediate_reference_points.append(reference_points)
 
         if self.return_intermediate:
             return torch.stack(intermediate), torch.stack(
                 intermediate_reference_points)
 
         return output, reference_points
+
 
 
 @ATTENTION.register_module()
@@ -276,9 +256,7 @@ class Detr3DCrossAtten(BaseModule):
                  dropout=0.1,
                  norm_cfg=None,
                  init_cfg=None,
-                 batch_first=False,
-                 multi_points=False,
-                 uncertainty_fusion=False):
+                 batch_first=False):
         super(Detr3DCrossAtten, self).__init__(init_cfg)
         if embed_dims % num_heads != 0:
             raise ValueError(f'embed_dims must be divisible by num_heads, '
@@ -288,8 +266,6 @@ class Detr3DCrossAtten(BaseModule):
         self.init_cfg = init_cfg
         self.dropout = nn.Dropout(dropout)
         self.pc_range = pc_range
-        self.multi_points = multi_points
-        self.uncertainty_fusion = uncertainty_fusion
 
         # you'd better set dim_per_head to a power of 2
         # which is more efficient in the CUDA implementation
@@ -313,14 +289,10 @@ class Detr3DCrossAtten(BaseModule):
         self.num_heads = num_heads
         self.num_points = num_points
         self.num_cams = num_cams
-    
-        if self.uncertainty_fusion:
-            self.cam_attention_weights = nn.Linear(embed_dims, 1)
-        self.attention_weights = nn.Linear(embed_dims, num_cams*num_levels*num_points)
-        if self.multi_points:
-            self.attention_weights_neighbor = nn.Linear(embed_dims, num_cams * num_levels * num_points * 8)
+        self.attention_weights = nn.Linear(embed_dims,
+                                           num_cams*num_levels*num_points)
 
-        self.output_proj = nn.Linear(embed_dims * 2 if self.multi_points else embed_dims, embed_dims)
+        self.output_proj = nn.Linear(embed_dims, embed_dims)
       
         self.position_encoder = nn.Sequential(
             nn.Linear(3, self.embed_dims), 
@@ -336,11 +308,7 @@ class Detr3DCrossAtten(BaseModule):
 
     def init_weight(self):
         """Default initialization for Parameters of Module."""
-        if self.uncertainty_fusion:
-            constant_init(self.cam_attention_weights, val=0., bias=0.)
         constant_init(self.attention_weights, val=0., bias=0.)
-        if self.multi_points:
-            constant_init(self.attention_weights_neighbor, val=0., bias=0.)
         xavier_init(self.output_proj, distribution='uniform', bias=0.)
 
     def forward(self,
@@ -399,57 +367,21 @@ class Detr3DCrossAtten(BaseModule):
 
         # change to (bs, num_query, embed_dims)
         query = query.permute(1, 0, 2)
+
         bs, num_query, _ = query.size()
 
-        # decompose reference points
-        reference_points_center = reference_points[:, :num_query]
-    
-        reference_points_3d, output_center, mask_center = feature_sampling(
-            value, reference_points_center, self.pc_range, kwargs['img_metas'])
-        # output = torch.nan_to_num(output)
-        # mask = torch.nan_to_num(mask)
-        nan_mask = torch.isnan(output_center)
-        output_center[nan_mask] = 0.
-        nan_mask = torch.isnan(mask_center)
-        mask_center[nan_mask] = 0.
-
-        
         attention_weights = self.attention_weights(query).view(
-        bs, 1, num_query, self.num_cams, self.num_points, self.num_levels)
+            bs, 1, num_query, self.num_cams, self.num_points, self.num_levels)
         
+        reference_points_3d, output, mask = feature_sampling(
+            value, reference_points, self.pc_range, kwargs['img_metas'])
+        output = torch.nan_to_num(output)
+        mask = torch.nan_to_num(mask)
 
-        if self.uncertainty_fusion:
-            new_cam_output_center = output_center.permute(0, 2, 3, 4, 5, 1)
-            cam_attention_weights = self.cam_attention_weights(new_cam_output_center)
-            cam_attention_weights = cam_attention_weights.permute(0, 5, 1, 2, 3, 4)
-            cam_attention_weights = cam_attention_weights.sigmoid() * mask_center
-            output_center = output_center * cam_attention_weights
-
-        attention_weights = attention_weights.sigmoid() * mask_center
-        output_center = output_center * attention_weights 
-        output = output_center.sum(-1).sum(-1).sum(-1)
+        attention_weights = attention_weights.sigmoid() * mask
+        output = output * attention_weights
+        output = output.sum(-1).sum(-1).sum(-1)
         output = output.permute(2, 0, 1)
-
-        if self.multi_points:
-            reference_points_neighbor = reference_points[:, num_query:]
-            attention_weights_neighbor = self.attention_weights_neighbor(query).view(
-                bs, 1, num_query * 8, self.num_cams, self.num_points, self.num_levels)
-            reference_points_neighbor, output_neighbor, mask_neighbor = feature_sampling(
-                value, reference_points_neighbor, self.pc_range, kwargs['img_metas'])
-            # output = torch.nan_to_num(output)
-            # mask = torch.nan_to_num(mask)
-            nan_mask = torch.isnan(output_neighbor)
-            output_neighbor[nan_mask] = 0.
-            nan_mask = torch.isnan(mask_neighbor)
-            mask_neighbor[nan_mask] = 0.
-
-            attention_weights_neighbor = attention_weights_neighbor.sigmoid() * mask_neighbor
-            output_neighbor = output_neighbor * attention_weights_neighbor
-            output_neighbor = output_neighbor.view(bs, self.embed_dims, 8, num_query, \
-                                    self.num_cams, self.num_points, self.num_levels)
-            output_neighbor = output_neighbor.sum(-1).sum(-1).sum(-1).sum(-2)
-            output_neighbor = output_neighbor.permute(2, 0, 1)
-            output = torch.cat([output, output_neighbor], dim=-1)
         
         output = self.output_proj(output)
         # (num_query, bs, embed_dims)
@@ -457,6 +389,10 @@ class Detr3DCrossAtten(BaseModule):
 
         return self.dropout(output) + inp_residual + pos_feat
 
+
+    
+
+    
 
 def feature_sampling(mlvl_feats, reference_points, pc_range, img_metas):
     lidar2img = []
@@ -478,7 +414,7 @@ def feature_sampling(mlvl_feats, reference_points, pc_range, img_metas):
     reference_points_cam = torch.matmul(lidar2img, reference_points).squeeze(-1)
     eps = 1e-5
     mask = (reference_points_cam[..., 2:3] > eps)
-    reference_points_cam = reference_points_cam[..., 0:2] / torch.max(
+    reference_points_cam = reference_points_cam[..., 0:2] / torch.maximum(
         reference_points_cam[..., 2:3], torch.ones_like(reference_points_cam[..., 2:3])*eps)
     reference_points_cam[..., 0] /= img_metas[0]['img_shape'][0][1]
     reference_points_cam[..., 1] /= img_metas[0]['img_shape'][0][0]
@@ -488,11 +424,7 @@ def feature_sampling(mlvl_feats, reference_points, pc_range, img_metas):
                  & (reference_points_cam[..., 1:2] > -1.0) 
                  & (reference_points_cam[..., 1:2] < 1.0))
     mask = mask.view(B, num_cam, 1, num_query, 1, 1).permute(0, 2, 3, 1, 4, 5)
-    # mask = torch.nan_to_num(mask)
-    # HARD CODE HERE NOTE
-    nan_mask = torch.isnan(mask)
-    mask[nan_mask] = 0.
-    # NOTE
+    mask = torch.nan_to_num(mask)
     sampled_feats = []
     for lvl, feat in enumerate(mlvl_feats):
         B, N, C, H, W = feat.size()
@@ -504,3 +436,275 @@ def feature_sampling(mlvl_feats, reference_points, pc_range, img_metas):
     sampled_feats = torch.stack(sampled_feats, -1)
     sampled_feats = sampled_feats.view(B, C, num_query, num_cam,  1, len(mlvl_feats))
     return reference_points_3d, sampled_feats, mask
+
+
+@ATTENTION.register_module()
+class Detr3DCrossAttenV2(BaseModule):
+    """An attention module used in Detr3d. (Deformable DETR)
+    Args:
+        embed_dims (int): The embedding dimension of Attention.
+            Default: 256.
+        num_heads (int): Parallel attention heads. Default: 64.
+        num_levels (int): The number of feature map used in
+            Attention. Default: 4.
+        num_points (int): The number of sampling points for
+            each query in each head. Default: 4.
+        im2col_step (int): The step used in image_to_column.
+            Default: 64.
+        dropout (float): A Dropout layer on `inp_residual`.
+            Default: 0..
+        init_cfg (obj:`mmcv.ConfigDict`): The Config for initialization.
+            Default: None.
+    """
+
+    def __init__(self,
+                 embed_dims=256,
+                 num_heads=8,
+                 num_levels=4,
+                 num_points=5,
+                 num_cams=6,
+                 im2col_step=64,
+                 pc_range=None,
+                 dropout=0.1,
+                 norm_cfg=None,
+                 init_cfg=None,
+                 batch_first=False):
+        super(Detr3DCrossAttenV2, self).__init__(init_cfg)
+        if embed_dims % num_heads != 0:
+            raise ValueError(f'embed_dims must be divisible by num_heads, '
+                             f'but got {embed_dims} and {num_heads}')
+        dim_per_head = embed_dims // num_heads # 256 // 8 = 32
+        self.norm_cfg = norm_cfg # None
+        self.init_cfg = init_cfg # None
+        self.dropout = nn.Dropout(dropout) # 0.1
+        self.pc_range = pc_range # [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+
+        # you'd better set dim_per_head to a power of 2
+        # which is more efficient in the CUDA implementation
+        def _is_power_of_2(n):
+            if (not isinstance(n, int)) or (n < 0):
+                raise ValueError(
+                    'invalid input for _is_power_of_2: {} (type: {})'.format(
+                        n, type(n)))
+            return (n & (n - 1) == 0) and n != 0
+
+        if not _is_power_of_2(dim_per_head):
+            warnings.warn(
+                "You'd better set embed_dims in "
+                'MultiScaleDeformAttention to make '
+                'the dimension of each attention head a power of 2 '
+                'which is more efficient in our CUDA implementation.')
+
+        self.im2col_step = im2col_step # 64
+        self.embed_dims = embed_dims # 256
+        self.num_levels = num_levels # 4
+        self.num_heads = num_heads # 8
+        self.num_points = num_points # 1
+        self.num_cams = num_cams # 6
+        self.attention_weights = nn.Linear(embed_dims,
+                                           num_cams * num_heads * num_levels * num_points) # (256, 6*8*4*4)-->768
+        self.sampling_offsets = nn.Linear(embed_dims, 
+                                          num_cams * num_heads * num_levels * num_points * 2) # (256, 6*8*4*4*2)-->1536
+        
+        self.output_proj = nn.Linear(embed_dims, embed_dims) # 256-->256
+      
+        self.position_encoder = nn.Sequential(
+            nn.Linear(3, self.embed_dims), # 3 --> 256
+            nn.LayerNorm(self.embed_dims), # 256
+            nn.ReLU(inplace=True),
+            nn.Linear(self.embed_dims, self.embed_dims), # 256-->256
+            nn.LayerNorm(self.embed_dims),
+            nn.ReLU(inplace=True),
+        )
+        self.batch_first = batch_first # False
+
+        self.init_weight()
+
+    def init_weight(self):
+        """Default initialization for Parameters of Module."""
+        constant_init(self.sampling_offsets, 0.) # 采样点的权重初始化
+        thetas = torch.arange(
+            self.num_heads,
+            dtype=torch.float32) * (2.0 * math.pi / self.num_heads) # 将2pi均分8份
+        grid_init = torch.stack([thetas.cos(), thetas.sin()], -1) # 对角度取cos和sin，并拼接 (8, 2), 一个圆上的点
+        # [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)]
+        grid_init = (grid_init /
+                     grid_init.abs().max(-1, keepdim=True)[0]).view(
+                         1, self.num_heads, 1, 1,
+                         2).repeat(self.num_cams, 1, self.num_levels, self.num_points, 1) # (8, 2)-->(1, 8, 1, 1, 2)-->(6, 8, 4, 4, 2)
+        for i in range(self.num_points):
+            grid_init[:, :, :, i, :] *= i + 1 # 在点的维度上乘索引
+
+        self.sampling_offsets.bias.data = grid_init.view(-1) # 采样点的bias初始化
+        constant_init(self.attention_weights, val=0., bias=0.)
+        xavier_init(self.output_proj, distribution='uniform', bias=0.)
+
+    def forward(self,
+                query,
+                key,
+                value,
+                residual=None,
+                query_pos=None,
+                key_padding_mask=None,
+                reference_points=None,
+                spatial_shapes=None,
+                level_start_index=None,
+                **kwargs):
+        """Forward Function of Detr3DCrossAtten.
+        Args:
+            query (Tensor): Query of Transformer with shape
+                (num_query, bs, embed_dims).
+            key (Tensor): The key tensor with shape
+                `(num_key, bs, embed_dims)`.
+            value (Tensor): The value tensor with shape
+                `(num_key, bs, embed_dims)`. (B, N, C, H, W)
+            residual (Tensor): The tensor used for addition, with the
+                same shape as `x`. Default None. If None, `x` will be used.
+            query_pos (Tensor): The positional encoding for `query`.
+                Default: None.
+            key_pos (Tensor): The positional encoding for `key`. Default
+                None.
+            reference_points (Tensor):  The normalized reference
+                points with shape (bs, num_query, 4),
+                all elements is range in [0, 1], top-left (0,0),
+                bottom-right (1, 1), including padding area.
+                or (N, Length_{query}, num_levels, 4), add
+                additional two dimensions is (w, h) to
+                form reference boxes.
+            key_padding_mask (Tensor): ByteTensor for `query`, with
+                shape [bs, num_key].
+            spatial_shapes (Tensor): Spatial shape of features in
+                different level. With shape  (num_levels, 2),
+                last dimension represent (h, w).
+            level_start_index (Tensor): The start index of each level.
+                A tensor has shape (num_levels) and can be represented
+                as [0, h_0*w_0, h_0*w_0+h_1*w_1, ...].
+        Returns:
+             Tensor: forwarded results with shape [num_query, bs, embed_dims].
+        """
+
+        if key is None:
+            key = query # (900, 1, 256)
+        if value is None:
+            value = key
+
+        if residual is None:
+            inp_residual = query  # (900, 1, 256)
+        if query_pos is not None:
+            query = query + query_pos # (900, 1, 256)
+
+        # change to (bs, num_query, embed_dims)
+        query = query.permute(1, 0, 2) # (1, 900, 256)
+
+        bs, num_query, _ = query.size() # 1, 900
+        
+        # (1, 900, 256) --> (1, 900, 768) --> (1, 900, 6, 8, 4*4)
+        attention_weights = self.attention_weights(query).view(
+            bs, num_query, self.num_cams, self.num_heads, self.num_levels * self.num_points)
+
+        attention_weights = attention_weights.softmax(-1)
+        # (1, 900, 6, 8, 4, 4) --> (1, 8, 900, 6, 4, 4) --> (1*8, 900, 6, 4, 4) --> (8, 1, 900, 6, 4, 4)
+        attention_weights = attention_weights.view(bs, num_query,
+                                                   self.num_cams,
+                                                   self.num_heads,
+                                                   self.num_levels,
+                                                   self.num_points).permute(0, 3, 1, 2, 4, 5).flatten(0, 1).unsqueeze(1)
+
+        sampling_offsets = self.sampling_offsets(query).view(
+            bs, num_query, self.num_cams, self.num_heads, self.num_levels, self.num_points, 2) # (1, 900, 6, 8, 4, 4, 2)
+ 
+        # (1, 900, 3)和(8, 32, 900, 6, 4, 4)和(1, 1, 900, 6, 1, 1)
+        reference_points_3d, output, mask = self.feature_sampling(
+            value, reference_points, sampling_offsets, self.pc_range, kwargs['img_metas'])
+        output = torch.nan_to_num(output) # (8, 32, 900, 6, 4, 4)
+        mask = torch.nan_to_num(mask) # (1, 1, 900, 6, 1, 1)
+        # (8, 1, 900, 6, 4, 4) * (1, 1, 900, 6, 1, 1) --> (8, 1, 900, 6, 4, 4)
+        attention_weights = attention_weights * mask
+        output = output * attention_weights # (8, 32, 900, 6, 4, 4)
+        # (8, 32, 900, 6, 4, 4) --> (8, 32, 900)
+        output = output.sum(-1).sum(-1).sum(-1)
+        #  (8, 32, 900) --> (1, 256, 900) --> (900, 1, 256)
+        output = output.view(bs, -1, num_query).permute(2, 0, 1)
+
+        output = self.output_proj(output) # 256-->256 : (900, 1, 256)
+        # (num_query, bs, embed_dims) --> (1, 900, 3) --> (1, 900, 256) --> (900, 1, 256)
+        pos_feat = self.position_encoder(inverse_sigmoid(reference_points_3d)).permute(1, 0, 2)
+
+        return self.dropout(output) + inp_residual + pos_feat # (900, 1, 256)
+
+
+    def feature_sampling(self, mlvl_feats, reference_points, sampling_offsets, pc_range, img_metas):
+        ###############################################
+        # 1.由归一化参考点-->lidar系下的实际参考点-->齐次坐标
+        ###############################################
+        lidar2img = []
+        for img_meta in img_metas:
+            lidar2img.append(img_meta['lidar2img'])
+        lidar2img = np.asarray(lidar2img) # (1, 6, 4, 4)
+        lidar2img = reference_points.new_tensor(lidar2img) # (1, 6, 4, 4)
+        reference_points = reference_points.clone() # (1, 900, 3)
+        reference_points_3d = reference_points.clone() # (1, 900, 3) 归一化参考点
+        # 将归一化参考点恢复到lidar系下的实际位置
+        reference_points[..., 0:1] = reference_points[..., 0:1]*(pc_range[3] - pc_range[0]) + pc_range[0]
+        reference_points[..., 1:2] = reference_points[..., 1:2]*(pc_range[4] - pc_range[1]) + pc_range[1]
+        reference_points[..., 2:3] = reference_points[..., 2:3]*(pc_range[5] - pc_range[2]) + pc_range[2]
+        # reference_points (B, num_queries, 4) 齐次坐标 (1, 900, 4)
+        reference_points = torch.cat((reference_points, torch.ones_like(reference_points[..., :1])), -1)
+        ###############################################
+        # 2.由lidar系转化为camera系 6个相机
+        ###############################################
+        B, num_query = reference_points.size()[:2] # 1, 900
+        num_cam = lidar2img.size(1) # 6 
+        # (1, 900, 4) --> (1, 1, 900, 4) --> (1, 6, 900, 4) --> (1, 6, 900, 4, 1)
+        reference_points = reference_points.view(B, 1, num_query, 4).repeat(1, num_cam, 1, 1).unsqueeze(-1)
+        # (1, 6, 4, 4) --> (1, 6, 1, 4, 4) --> (1, 6, 900, 4, 4)
+        lidar2img = lidar2img.view(B, num_cam, 1, 4, 4).repeat(1, 1, num_query, 1, 1)
+        # (1, 6, 900, 4, 1) --> (1, 6, 900, 4)
+        reference_points_cam = torch.matmul(lidar2img, reference_points).squeeze(-1)
+        ###############################################
+        # 3.由camera系转到图像系并归一化
+        ###############################################
+        eps = 1e-5
+        mask = (reference_points_cam[..., 2:3] > eps) # 深度大于eps (1, 6, 900, 1)
+        reference_points_cam = reference_points_cam[..., 0:2] / torch.maximum(
+            reference_points_cam[..., 2:3], torch.ones_like(reference_points_cam[..., 2:3])*eps) # 深度归一化 (1, 6, 900, 2)
+        reference_points_cam[..., 0] /= img_metas[0]['img_shape'][0][1] # 长宽归一化
+        reference_points_cam[..., 1] /= img_metas[0]['img_shape'][0][0] # (1, 6, 900, 2)
+        ###############################################
+        # 4. 为F.grid_sample准备同时计算mask
+        ###############################################
+        reference_points_cam = (reference_points_cam - 0.5) * 2 # 为F.grid_sample做准备 (1, 6, 900, 2)
+
+        mask = (mask & (reference_points_cam[..., 0:1] > -1.0) 
+                    & (reference_points_cam[..., 0:1] < 1.0) 
+                    & (reference_points_cam[..., 1:2] > -1.0) 
+                    & (reference_points_cam[..., 1:2] < 1.0)) # 过滤无效点 (1, 6, 900, 1)
+        # (1, 6, 900, 1)-->(1, 6, 1, 900, 1, 1)-->(1, 1, 900, 6, 1, 1)
+        mask = mask.view(B, num_cam, 1, num_query, 1, 1).permute(0, 2, 3, 1, 4, 5)
+        mask = torch.nan_to_num(mask)
+        ###############################################
+        # 5.逐层特征提取
+        ###############################################
+        sampled_feats = []
+        for lvl, feat in enumerate(mlvl_feats):
+            B, N, C, H, W = feat.size() # eg: 1, 6, 256, 116, 200
+            # (1, 6, 256, 116, 200) --> (1, 6, 8, 32, 116, 200) --> (1, 8, 6, 32, 116, 200) --> (48, 32, 116, 200)
+            feat = feat.view(B, N, self.num_heads, C // self.num_heads, H, W).transpose(1, 2).flatten(0, 2)
+            # (1, 6, 900, 2)-->(6, 900, 1, 2)
+            reference_points_cam_lvl = reference_points_cam.view(B*N, num_query, 1, 2) 
+            # sampling_offsets: (1, 900, 6, 8, 4, 4, 2) --> (1, 900, 6, 8, 4, 2) --> (1, 8, 6, 900, 4, 2)-->(8, 6, 900, 4, 2)
+            sampling_offset_lvl  = sampling_offsets[:, :, :, :, lvl, :].permute(0, 3, 2, 1, 4, 5).flatten(0, 1)
+            # (1, 2) --> (1, 1, 1, 1, 2)
+            offset_normalizer = feat.new_tensor([W, H])[None, None, None] 
+            # (6, 900, 1, 2)-->(1, 6, 900, 1, 2) + (8, 6, 900, 4, 2) / (1, 1, 1, 1, 2) --> (8, 6, 900, 4, 2)
+            sampling_locations_lvl = reference_points_cam_lvl[None] + sampling_offset_lvl / offset_normalizer
+            sampling_locations_lvl = sampling_locations_lvl.flatten(0, 1) # (48, 900, 4, 2)
+            # feat:(48, 32, 116, 200)
+            # reference_points_cam_lvl:(48, 900, 4, 2)
+            # sampled_feat:(48, 32, 900, 4)
+            sampled_feat = F.grid_sample(feat, sampling_locations_lvl)
+            # (48, 32, 900, 4) --> (1*8, 6, 32, 900, 4) --> (1*8, 32, 900, 6, 4)
+            sampled_feat = sampled_feat.view(B*self.num_heads, self.num_cams, -1, num_query, self.num_points).permute(0, 2, 3, 1, 4)
+            sampled_feats.append(sampled_feat) # (8, 32, 900, 6, 4)
+        sampled_feats = torch.stack(sampled_feats, -1) # (8, 32, 900, 6, 4, 4)
+        return reference_points_3d, sampled_feats, mask # (1, 900, 3)和(8, 32, 900, 6, 4, 4)和(1, 1, 900, 6, 1, 1)

@@ -3,7 +3,7 @@ import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mmcv.cnn import Linear, bias_init_with_prob, ConvModule
+from mmcv.cnn import Linear, bias_init_with_prob
 from mmcv.runner import force_fp32
                         
 from mmdet.core import (multi_apply, multi_apply, reduce_mean)
@@ -32,11 +32,6 @@ class Detr3DHead(DETRHead):
                  bbox_coder=None,
                  num_cls_fcs=2,
                  code_weights=None,
-                 add_feat_embed_for_resize=False,
-                 add_feat_embed_for_cam=False,
-                 embed_type='sine',
-                 use_add=True,
-                 internal=False,
                  **kwargs):
         self.with_box_refine = with_box_refine
         self.as_two_stage = as_two_stage
@@ -50,6 +45,7 @@ class Detr3DHead(DETRHead):
             self.code_weights = code_weights
         else:
             self.code_weights = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
+        self.code_weights = self.code_weights[:self.code_size]
         
         self.bbox_coder = build_bbox_coder(bbox_coder)
         self.pc_range = self.bbox_coder.pc_range
@@ -58,15 +54,6 @@ class Detr3DHead(DETRHead):
             *args, transformer=transformer, **kwargs)
         self.code_weights = nn.Parameter(torch.tensor(
             self.code_weights, requires_grad=False), requires_grad=False)
-
-        self.add_feat_embed_for_resize = add_feat_embed_for_resize
-        self.add_feat_embed_for_cam = add_feat_embed_for_cam
-        self.embed_type = embed_type
-        if self.embed_type in ['sine', 'fourier']:
-            from projects.mmdet3d_plugin.models.utils.positional_embedding \
-                            import PositionEmbeddingCoordsSine
-            self.pe_generator = PositionEmbeddingCoordsSine(pos_type=self.embed_type)
-        self.internal = internal
 
     def _init_layers(self):
         """Initialize classification branch and regression branch of head."""
@@ -128,34 +115,17 @@ class Detr3DHead(DETRHead):
                 head with normalized coordinate format (cx, cy, w, l, cz, h, theta, vx, vy). \
                 Shape [nb_dec, bs, num_query, 9].
         """
-
+        # for feat in mlvl_feats:
+        #     print(feat.size())
         query_embeds = self.query_embedding.weight
-        bs, num_cam, num_channels, _, _ = mlvl_feats[0].shape
-        if self.add_feat_embed_for_resize:
-            # pos_embed_for_resize = (img_metas[0]['scale_factor'] - 1.0) / 0.25
-            pos_embed_for_resize = img_metas[0]['scale_factor']
-            # assert pos_embed_for_resize in [-1, 0, 1], "Resize Ratio Need to be Modified"
-            if self.embed_type == 'constant':
-                mlvl_feats = [mlvl_feat + pos_embed_for_resize for mlvl_feat in mlvl_feats]
-            else:
-                embed_xyz = query_embeds.new_ones((1, 1, 1)) * pos_embed_for_resize
-                # output shape (bs, num_points, C)
-                position_embed_data = self.pe_generator(embed_xyz, num_channels).view(bs, 1, -1, 1, 1)
-                mlvl_feats = [mlvl_feat + pos_embed_for_resize for mlvl_feat in mlvl_feats]
-
-        if self.add_feat_embed_for_cam:
-            for ii in range(num_cam):
-                embed_xyz = query_embeds.new_ones((1, 1, 1)) * ii
-                position_embed_data = self.pe_generator(embed_xyz, num_channels).view(bs, 1, -1, 1, 1)
-                for lvl in range(len(mlvl_feats)):
-                    mlvl_feats[lvl][:, ii:ii+1] += position_embed_data
-
+        
         hs, init_reference, inter_references = self.transformer(
             mlvl_feats,
             query_embeds,
             reg_branches=self.reg_branches if self.with_box_refine else None,  # noqa:E501
             img_metas=img_metas,
         )
+        # print(weights[0].size())
         hs = hs.permute(0, 2, 1, 3)
         outputs_classes = []
         outputs_coords = []
@@ -166,6 +136,7 @@ class Detr3DHead(DETRHead):
             else:
                 reference = inter_references[lvl - 1]
             reference = inverse_sigmoid(reference)
+
             outputs_class = self.cls_branches[lvl](hs[lvl])
             tmp = self.reg_branches[lvl](hs[lvl])
 
@@ -178,7 +149,7 @@ class Detr3DHead(DETRHead):
             tmp[..., 0:1] = (tmp[..., 0:1] * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0])
             tmp[..., 1:2] = (tmp[..., 1:2] * (self.pc_range[4] - self.pc_range[1]) + self.pc_range[1])
             tmp[..., 4:5] = (tmp[..., 4:5] * (self.pc_range[5] - self.pc_range[2]) + self.pc_range[2])
-
+            
             # TODO: check if using sigmoid
             outputs_coord = tmp
             outputs_classes.append(outputs_class)
@@ -241,11 +212,11 @@ class Detr3DHead(DETRHead):
         label_weights = gt_bboxes.new_ones(num_bboxes)
 
         # bbox targets
-        tmp_idx = 7 if self.internal else 9
-        bbox_targets = torch.zeros_like(bbox_pred)[..., :tmp_idx]
+        code_size = gt_bboxes.size(1)
+        bbox_targets = torch.zeros_like(bbox_pred)[..., :code_size]
         bbox_weights = torch.zeros_like(bbox_pred)
         bbox_weights[pos_inds] = 1.0
-
+        # print(gt_bboxes.size(), bbox_pred.size())
         # DETR
         bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
         return (labels, label_weights, bbox_targets, bbox_weights, 
@@ -362,18 +333,12 @@ class Detr3DHead(DETRHead):
         normalized_bbox_targets = normalize_bbox(bbox_targets, self.pc_range)
         isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)
         bbox_weights = bbox_weights * self.code_weights
-        
-        tmp_idx = 8 if self.internal else 10
-        loss_bbox = self.loss_bbox(
-                bbox_preds[isnotnan, :tmp_idx], normalized_bbox_targets[isnotnan, :tmp_idx], \
-                        bbox_weights[isnotnan, :tmp_idx], avg_factor=num_total_pos)
 
-        tmp_mask = torch.isnan(loss_cls)
-        loss_cls[tmp_mask] = 0.
-        tmp_mask = torch.isnan(loss_bbox)
-        loss_bbox[tmp_mask] = 0.
-        # loss_cls = torch.nan_to_num(loss_cls)
-        # loss_bbox = torch.nan_to_num(loss_bbox)
+        loss_bbox = self.loss_bbox(
+                bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan, :10], bbox_weights[isnotnan, :10], avg_factor=num_total_pos)
+
+        loss_cls = torch.nan_to_num(loss_cls)
+        loss_bbox = torch.nan_to_num(loss_bbox)
         return loss_cls, loss_bbox
     
     @force_fp32(apply_to=('preds_dicts'))
@@ -384,7 +349,6 @@ class Detr3DHead(DETRHead):
              gt_bboxes_ignore=None):
         """"Loss function.
         Args:
-            
             gt_bboxes_list (list[Tensor]): Ground truth bboxes for each image
                 with shape (num_gts, 4) in [tl_x, tl_y, br_x, br_y] format.
             gt_labels_list (list[Tensor]): Ground truth class indices for each
@@ -477,7 +441,8 @@ class Detr3DHead(DETRHead):
             preds = preds_dicts[i]
             bboxes = preds['bboxes']
             bboxes[:, 2] = bboxes[:, 2] - bboxes[:, 5] * 0.5
-            bboxes = img_metas[i]['box_type_3d'](bboxes, 9)
+            # print(bboxes.size())
+            bboxes = img_metas[i]['box_type_3d'](bboxes, bboxes.size(-1))
             scores = preds['scores']
             labels = preds['labels']
             ret_list.append([bboxes, scores, labels])

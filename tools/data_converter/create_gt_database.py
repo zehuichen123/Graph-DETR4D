@@ -1,3 +1,4 @@
+# Copyright (c) OpenMMLab. All rights reserved.
 import mmcv
 import numpy as np
 import pickle
@@ -104,31 +105,6 @@ def crop_image_patch(pos_proposals, gt_masks, pos_assigned_gt_inds, org_img):
         masks.append(mask_patch)
     return img_patches, masks
 
-def crop_img_patch_with_box(pos_proposals, org_img):
-    num_pos = pos_proposals.shape[0]
-    img_patches = []
-    for i in range(num_pos):
-        bbox = pos_proposals[i, :].astype(np.int32)
-        x1, y1, x2, y2 = bbox
-        w = np.maximum(x2 - x1 + 1, 1)
-        h = np.maximum(y2 - y1 + 1, 1)
-
-        img_patch = org_img[y1:y1 + h, x1:x1 + w]
-        img_patches.append(img_patch)
-    return img_patches
-
-def crop_img_patch_with_box_v2(pos_proposals, org_img_list):
-    num_pos = pos_proposals.shape[0]
-    img_patches = []
-    for i in range(num_pos):
-        bbox = pos_proposals[i, :].astype(np.int32)
-        x1, y1, x2, y2, num_img = bbox
-        w = np.maximum(x2 - x1 + 1, 1)
-        h = np.maximum(y2 - y1 + 1, 1)
-
-        img_patch = org_img_list[num_img][y1:y1 + h, x1:x1 + w]
-        img_patches.append(img_patch)
-    return img_patches
 
 def create_groundtruth_database(dataset_class_name,
                                 data_path,
@@ -143,9 +119,9 @@ def create_groundtruth_database(dataset_class_name,
                                 lidar_only=False,
                                 bev_only=False,
                                 coors_range=None,
-                                with_mask=False,
-                                with_bbox=False):
+                                with_mask=False):
     """Given the raw data, generate the ground truth database.
+
     Args:
         dataset_class_name （str): Name of the input dataset.
         data_path (str): Path of the data.
@@ -177,10 +153,9 @@ def create_groundtruth_database(dataset_class_name,
                 use_lidar=True,
                 use_depth=False,
                 use_lidar_intensity=True,
-                use_camera=with_mask or with_bbox,
+                use_camera=with_mask,
             ),
             pipeline=[
-                dict(type='LoadImageFromFile'),
                 dict(
                     type='LoadPointsFromFile',
                     coord_type='LIDAR',
@@ -191,39 +166,12 @@ def create_groundtruth_database(dataset_class_name,
                     type='LoadAnnotations3D',
                     with_bbox_3d=True,
                     with_label_3d=True,
-                    with_bbox=True,
-                    with_label=True,
                     file_client_args=file_client_args)
             ])
 
     elif dataset_class_name == 'NuScenesDataset':
-        # dataset_cfg.update(
-        #     use_valid_flag=True,
-        #     pipeline=[
-        #         dict(
-        #             type='LoadPointsFromFile',
-        #             coord_type='LIDAR',
-        #             load_dim=5,
-        #             use_dim=5),
-        #         dict(
-        #             type='LoadPointsFromMultiSweeps',
-        #             sweeps_num=10,
-        #             use_dim=[0, 1, 2, 3, 4],
-        #             pad_empty_sweeps=True,
-        #             remove_close=True),
-        #         dict(
-        #             type='LoadAnnotations3D',
-        #             with_bbox_3d=True,
-        #             with_label_3d=True)
-        #     ])
         dataset_cfg.update(
             use_valid_flag=True,
-            modality=dict(
-                use_lidar=True,
-                use_depth=False,
-                use_lidar_intensity=True,
-                use_camera=with_mask or with_bbox,
-            ),
             pipeline=[
                 dict(
                     type='LoadPointsFromFile',
@@ -236,29 +184,24 @@ def create_groundtruth_database(dataset_class_name,
                     use_dim=[0, 1, 2, 3, 4],
                     pad_empty_sweeps=True,
                     remove_close=True),
-                dict(type='LoadMultiViewImageFromFiles'),
                 dict(
                     type='LoadAnnotations3D',
                     with_bbox_3d=True,
-                    with_label_3d=True,
-                    with_bbox=True,
-                    with_label=True)
+                    with_label_3d=True)
             ])
 
     elif dataset_class_name == 'WaymoDataset':
         file_client_args = dict(backend='disk')
         dataset_cfg.update(
-            load_interval=5,
             test_mode=False,
             split='training',
             modality=dict(
                 use_lidar=True,
                 use_depth=False,
                 use_lidar_intensity=True,
-                use_camera=True,
+                use_camera=False,
             ),
             pipeline=[
-                dict(type='LoadMultiViewImageFromFilesWaymo'),
                 dict(
                     type='LoadPointsFromFile',
                     coord_type='LIDAR',
@@ -269,8 +212,6 @@ def create_groundtruth_database(dataset_class_name,
                     type='LoadAnnotations3D',
                     with_bbox_3d=True,
                     with_label_3d=True,
-                    with_bbox=True,
-                    with_label=True,
                     file_client_args=file_client_args)
             ])
 
@@ -313,16 +254,6 @@ def create_groundtruth_database(dataset_class_name,
         num_obj = gt_boxes_3d.shape[0]
         point_indices = box_np_ops.points_in_rbbox(points, gt_boxes_3d)
 
-        if with_bbox:
-            gt_boxes = example['gt_bboxes']
-            img_path = osp.split(example['img_info']['filename'][0])[-1]
-            # img_path = osp.split(example['img_filename'][0])[-1]
-            if gt_boxes.shape[0] == 0:
-                print(f'skip image {img_path} for empty mask')
-                continue
-            h, w = example['img_shape'][:2]
-            object_img_patches = crop_img_patch_with_box(gt_boxes, example['img'])
-
         if with_mask:
             # prepare masks
             gt_boxes = annos['gt_bboxes']
@@ -363,23 +294,17 @@ def create_groundtruth_database(dataset_class_name,
             gt_points = points[point_indices[:, i]]
             gt_points[:, :3] -= gt_boxes_3d[i, :3]
 
-            if with_bbox:
+            if with_mask:
+                if object_masks[i].sum() == 0 or not valid_inds[i]:
+                    # Skip object for empty or invalid mask
+                    continue
                 img_patch_path = abs_filepath + '.png'
-                if not osp.exists(img_patch_path):
-                    mmcv.imwrite(object_img_patches[i], img_patch_path)
+                mask_patch_path = abs_filepath + '.mask.png'
+                mmcv.imwrite(object_img_patches[i], img_patch_path)
+                mmcv.imwrite(object_masks[i], mask_patch_path)
 
-            # if with_mask:
-            #     if object_masks[i].sum() == 0 or not valid_inds[i]:
-            #         # Skip object for empty or invalid mask
-            #         continue
-            #     img_patch_path = abs_filepath + '.png'
-            #     mask_patch_path = abs_filepath + '.mask.png'
-            #     mmcv.imwrite(object_img_patches[i], img_patch_path)
-            #     mmcv.imwrite(object_masks[i], mask_patch_path)
-
-            if not osp.exists(abs_filepath):
-                with open(abs_filepath, 'w') as f:
-                    gt_points.tofile(f)
+            with open(abs_filepath, 'w') as f:
+                gt_points.tofile(f)
 
             if (used_classes is None) or names[i] in used_classes:
                 db_info = {
@@ -399,8 +324,6 @@ def create_groundtruth_database(dataset_class_name,
                 db_info['group_id'] = group_dict[local_group_id]
                 if 'score' in annos:
                     db_info['score'] = annos['score'][i]
-                if with_bbox:
-                    db_info.update({'box2d_camera': gt_boxes[i]})
                 if with_mask:
                     db_info.update({'box2d_camera': gt_boxes[i]})
                 if names[i] in all_db_infos:

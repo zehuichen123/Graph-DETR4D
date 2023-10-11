@@ -5,16 +5,12 @@ import torch.nn.functional as F
 from mmcv.cnn import xavier_init, constant_init
 from mmcv.cnn.bricks.registry import (ATTENTION,
                                       TRANSFORMER_LAYER_SEQUENCE)
-# from mmcv.cnn.bricks.transformer import (MultiScaleDeformableAttention,
-#                                          TransformerLayerSequence,
-#                                          build_transformer_layer_sequence)
+
 from mmcv.runner.base_module import BaseModule
 
-from mmdet.models.utils.builder import TRANSFORMER
 import math
-import time
+import warnings
 
-# import transformer based deformable detr
 from mmcv.ops.multi_scale_deform_attn import MultiScaleDeformableAttnFunction, multi_scale_deformable_attn_pytorch
 
 def inverse_sigmoid(x, eps=1e-5):
@@ -30,8 +26,8 @@ def inverse_sigmoid(x, eps=1e-5):
             shape with input.
     """
     x = x.clamp(min=0, max=1)
-    x1 = x.clamp(min=eps)
-    x2 = (1 - x).clamp(min=eps)
+    x1 = x.clamp(min=eps, max=1)
+    x2 = (1 - x).clamp(min=eps, max=1)
     return torch.log(x1 / x2)
 
 @ATTENTION.register_module()
@@ -66,8 +62,7 @@ class Deform3DCrossAttn(BaseModule):
                  init_cfg=None,
                  batch_first=False,
                  fix_offset=False,
-                 depth_encode=False,
-                 uncertainty_fusion=False):
+                 depth_encode=False):
         super(Deform3DCrossAttn, self).__init__(init_cfg)
         if embed_dims % num_heads != 0:
             raise ValueError(f'embed_dims must be divisible by num_heads, '
@@ -79,7 +74,6 @@ class Deform3DCrossAttn(BaseModule):
         self.pc_range = pc_range
         self.fix_offset = fix_offset
         self.depth_encode = depth_encode
-        self.uncertainty_fusion = uncertainty_fusion
 
         # you'd better set dim_per_head to a power of 2
         # which is more efficient in the CUDA implementation
@@ -105,8 +99,6 @@ class Deform3DCrossAttn(BaseModule):
         self.num_cams = num_cams
         self.cam_attention_weights = nn.Linear(embed_dims,
                                            num_cams)
-        if self.uncertainty_fusion:
-            self.uncertainty_weights = nn.Linear(embed_dims, 1)
         self.output_proj = nn.Linear(embed_dims, embed_dims)
       
         self.position_encoder = nn.Sequential(
@@ -154,8 +146,6 @@ class Deform3DCrossAttn(BaseModule):
         for i in range(self.num_points):
             grid_init[:, :, i, :] *= i + 1
         self.deform_sampling_offsets.bias.data = grid_init.view(-1)
-        if self.uncertainty_fusion:
-            constant_init(self.uncertainty_weights, val=0., bias=0.)
         constant_init(self.attention_weights, val=0., bias=0.)
         xavier_init(self.value_proj, distribution='uniform', bias=0.)
 
@@ -235,7 +225,7 @@ class Deform3DCrossAttn(BaseModule):
 
         # add offset before projecting them onto 2d plane
         sampling_offsets = self.deform_sampling_offsets(query).view(
-            bs, num_query, self.num_heads, 1, self.num_points, 3).repeat(1, 1, 1, self.num_points, 1, 1)
+            bs, num_query, self.num_heads, 1, self.num_points, 3).repeat(1, 1, 1, self.num_levels, 1, 1)
         reference_points = reference_points.view(bs, num_query, 1, 1, 1, 3) + sampling_offsets
         reference_points = reference_points.view(bs, num_query * self.num_heads * self.num_levels * self.num_points, 3)
         # reference_points (B, num_queries, 4)
@@ -330,11 +320,6 @@ class Deform3DCrossAttn(BaseModule):
         cam_attention_weights = cam_attention_weights.sigmoid()
         # attention_weights = attention_weights.permute(0, 2, 3, 1)
         output = output.view(bs, self.num_cams, num_query, -1)
-
-        if self.uncertainty_fusion:
-            uncertainty_weights = self.uncertainty_weights(output).sigmoid()
-            output = output * uncertainty_weights
-            
         output = output * cam_attention_weights
         output = output.sum(1)
         

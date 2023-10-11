@@ -12,7 +12,6 @@ from typing import List, Tuple, Union
 
 from mmdet3d.core.bbox.box_np_ops import points_cam2img
 from mmdet3d.datasets import NuScenesDataset
-import cv2
 
 nus_categories = ('car', 'truck', 'trailer', 'bus', 'construction_vehicle',
                   'bicycle', 'motorcycle', 'pedestrian', 'traffic_cone',
@@ -22,49 +21,6 @@ nus_attributes = ('cycle.with_rider', 'cycle.without_rider',
                   'pedestrian.moving', 'pedestrian.standing',
                   'pedestrian.sitting_lying_down', 'vehicle.moving',
                   'vehicle.parked', 'vehicle.stopped', 'None')
-
-color_list = [[0, 153, 51], [0, 153, 255], [255, 255, 0], [204, 102, 255],\
-              [255, 0, 0], [204, 0, 255], [102, 255, 255], [255, 102, 102]]
-ratio = 1
-def draw_bbox(img, bbox_score_data, index=0, show_score=False):
-    global color_list
-    index %= 5
-    test = list(map(lambda x: int(x), bbox_score_data[:4]))
-    img = cv2.rectangle(img, (test[0], test[1]), (test[2], test[3]), color_list[index], 2)
-    if show_score:
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        text = ""
-        if show_score:
-            text += str(bbox_score_data[4])[:4]
-        rec_width = len(text) * 6
-        img = cv2.rectangle(img, (test[0], test[1]), (test[0]+rec_width, test[1]+10), color_list[index], -1)
-        cv2.putText(img, text, (test[0], test[1]+8), font, 0.35, (0, 0, 0), 1)
-    return img
-
-def post_process_coords(corner_coords: List,
-                        imsize: Tuple[int, int] = (1600, 900)) -> Union[Tuple[float, float, float, float], None]:
-    """
-    Get the intersection of the convex hull of the reprojected bbox corners and the image canvas, return None if no
-    intersection.
-    :param corner_coords: Corner coordinates of reprojected bounding box.
-    :param imsize: Size of the image canvas.
-    :return: Intersection of the convex hull of the 2D box corners and the image canvas.
-    """
-    polygon_from_2d_box = MultiPoint(corner_coords).convex_hull
-    img_canvas = box(0, 0, imsize[0], imsize[1])
-
-    if polygon_from_2d_box.intersects(img_canvas):
-        img_intersection = polygon_from_2d_box.intersection(img_canvas)
-        intersection_coords = np.array([coord for coord in img_intersection.exterior.coords])
-
-        min_x = min(intersection_coords[:, 0])
-        min_y = min(intersection_coords[:, 1])
-        max_x = max(intersection_coords[:, 0])
-        max_y = max(intersection_coords[:, 1])
-
-        return min_x, min_y, max_x, max_y
-    else:
-        return None
 
 
 def create_nuscenes_infos(root_path,
@@ -218,6 +174,7 @@ def _fill_trainval_infos(nusc,
         mmcv.check_file_exist(lidar_path)
 
         info = {
+            'lidar_token': lidar_token,
             'lidar_path': lidar_path,
             'token': sample['token'],
             'sweeps': [],
@@ -247,13 +204,17 @@ def _fill_trainval_infos(nusc,
         ]
         for cam in camera_types:
             cam_token = sample['data'][cam]
-            cam_path, box_list, cam_intrinsic = nusc.get_sample_data(cam_token)
-            # tmp_img = cv2.imread(cam_path)
-            # cv2.imwrite('nus_code/fig/%s' % cam_path.split('/')[-1], tmp_img)
+            cam_path, _, cam_intrinsic = nusc.get_sample_data(cam_token)
             cam_info = obtain_sensor2top(nusc, cam_token, l2e_t, l2e_r_mat,
                                          e2g_t, e2g_r_mat, cam)
             cam_info.update(cam_intrinsic=cam_intrinsic)
             info['cams'].update({cam: cam_info})
+
+            sd_rec = nusc.get('sample_data', cam_token)
+            s_rec = nusc.get('sample', sd_rec['sample_token'])
+            ann_recs = [nusc.get('sample_annotation', token) for token in s_rec['anns']]
+            visibility = [ann_rec['visibility_token'] for ann_rec in ann_recs]
+            # print(visibility)
 
         # obtain sweeps for a single key-frame
         sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
@@ -308,48 +269,6 @@ def _fill_trainval_infos(nusc,
                 [a['num_radar_pts'] for a in annotations])
             info['valid_flag'] = valid_flag
 
-            gt_boxes_2d = []
-            all_2d_boxes = []
-            # NOTE generate projected one-to-one 2d box
-            for anno in annotations:
-                box = nusc.get_box(anno['token'])
-                has_proj = False
-                for index, cam in enumerate(camera_types):
-                    tmp_box = box.copy()
-                    cam_info = info['cams'][cam]
-                    tmp_box.translate(-np.array(cam_info['ego2global_translation']))
-                    tmp_box.rotate(Quaternion(cam_info['ego2global_rotation']).inverse)
-                    # Move them to the calibrated sensor frame.
-                    tmp_box.translate(-np.array(cam_info['sensor2ego_translation']))
-                    tmp_box.rotate(Quaternion(cam_info['sensor2ego_rotation']).inverse)
-
-                    # Filter out the corners that are not in front of the calibrated sensor.
-                    corners_3d = tmp_box.corners()
-                    # print(corners_3d)
-                    in_front = np.argwhere(corners_3d[2, :] > 0).flatten()
-                    corners_3d = corners_3d[:, in_front]
-
-                    # Project 3d box to 2d.
-                    corner_coords = view_points(corners_3d, cam_info['cam_intrinsic'], True).T[:, :2].tolist()
-                    # Keep only corners that fall within the image.
-                    final_coords = post_process_coords(corner_coords)
-                    # Skip if the convex hull of the re-projected corners does not intersect the image canvas.
-                    if final_coords is None:
-                        continue
-                    else:
-                        min_x, min_y, max_x, max_y = final_coords
-                        if has_proj == False:
-                            gt_boxes_2d.append([min_x, min_y, max_x, max_y, index])
-                            has_proj = True
-                        # img = cv2.imread('nus_code/fig/%s' % cam_info['data_path'].split('/')[-1])
-                        # img = draw_bbox(img, final_coords)
-                        # cv2.imwrite('nus_code/fig/%s' % cam_info['data_path'].split('/')[-1], img)
-                        all_2d_boxes.append([min_x, min_y, max_x, max_y, index])
-                if has_proj == False:
-                    gt_boxes_2d.append([0, 0, 1, 1, 5])
-            info['gt_boxes_2d'] = np.array(gt_boxes_2d)
-            info['all_2d_boxes'] = np.array(all_2d_boxes)
-            assert info['gt_boxes_2d'].shape[0] == len(gt_boxes), (len(gt_boxes), info['gt_boxes_2d'])
         if sample['scene_token'] in train_scenes:
             train_nusc_infos.append(info)
         else:

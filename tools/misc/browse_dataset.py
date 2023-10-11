@@ -4,7 +4,6 @@ import numpy as np
 import warnings
 from mmcv import Config, DictAction, mkdir_or_exist, track_iter_progress
 from os import path as osp
-import os
 
 from mmdet3d.core.bbox import (Box3DMode, CameraInstance3DBoxes, Coord3DMode,
                                DepthInstance3DBoxes, LiDARInstance3DBoxes)
@@ -184,44 +183,11 @@ def show_proj_bbox_img(idx,
 
 def main():
     args = parse_args()
-    import sys
-    sys.path.append('./')
 
     if args.output_dir is not None:
         mkdir_or_exist(args.output_dir)
 
-    cfg = Config.fromfile(args.config)
-    cfg.data.test.test_mode = True
-
-    # import modules from string list.
-    if cfg.get('custom_imports', None):
-        from mmcv.utils import import_modules_from_strings
-        import_modules_from_strings(**cfg['custom_imports'])
-
-    # import modules from plguin/xx, registry will be updated
-    if hasattr(cfg, 'plugin'):
-        if cfg.plugin:
-            import importlib
-            if hasattr(cfg, 'plugin_dir'):
-                plugin_dir = cfg.plugin_dir
-                _module_dir = os.path.dirname(plugin_dir)
-                _module_dir = _module_dir.split('/')
-                _module_path = _module_dir[0]
-
-                for m in _module_dir[1:]:
-                    _module_path = _module_path + '.' + m
-                print(_module_path)
-                plg_lib = importlib.import_module(_module_path)
-            else:
-                # import dir is the dirpath for the config file
-                _module_dir = os.path.dirname(args.config)
-                _module_dir = _module_dir.split('/')
-                _module_path = _module_dir[0]
-                for m in _module_dir[1:]:
-                    _module_path = _module_path + '.' + m
-                print(_module_path)
-                plg_lib = importlib.import_module(_module_path)
-
+    cfg = build_data_cfg(args.config, args.skip_type, args.cfg_options)
     try:
         dataset = build_dataset(
             cfg.data.train, default_args=dict(filter_empty_gt=False))
@@ -243,13 +209,13 @@ def main():
             data_path = data_info['pts_path']
         elif dataset_type in ['NuScenesDataset', 'LyftDataset']:
             data_path = data_info['lidar_path']
-        elif dataset_type in ['NuScenesMonoDataset', 'InternalMonoDataset']:
+        elif dataset_type in ['NuScenesMonoDataset']:
             data_path = data_info['file_name']
         else:
             raise NotImplementedError(
                 f'unsupported dataset type {dataset_type}')
 
-        file_name = osp.splitext(osp.basename(data_path))[0] + '_%s' % data_info['sensor_name']
+        file_name = osp.splitext(osp.basename(data_path))[0]
 
         if vis_task in ['det', 'multi_modality-det']:
             # show 3D bboxes on 3D point clouds
