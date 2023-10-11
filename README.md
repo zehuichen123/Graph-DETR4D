@@ -8,6 +8,9 @@
 </center>
 </div>
 
+## NOTE
+If you want to run Graph-DETR3D, please check to `graph-detr3d` branch.
+
 ## Performance
 
 ### Nuscenes Validation Set
